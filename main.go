@@ -6,6 +6,7 @@ import (
 
 	"github.com/alecthomas/kong"
 
+	"github.com/crossplane/function-auto-ready/features"
 	"github.com/crossplane/function-sdk-go"
 	"github.com/crossplane/function-sdk-go/response"
 )
@@ -20,6 +21,8 @@ type CLI struct {
 	Insecure           bool           `help:"Run without mTLS credentials. If you supply this flag --tls-server-certs-dir will be ignored."`
 	MaxRecvMessageSize int            `help:"Maximum size of received messages in MB." default:"4"`
 	TTL                *time.Duration `help:"Time to live for function response."`
+
+	FeatureGates string `default:""     help:"Feature gates to enable/disable (e.g. CELHealthcheckCustomizations=true)."`
 }
 
 // Run this Function.
@@ -33,7 +36,13 @@ func (c *CLI) Run() error {
 		ttl = *c.TTL
 	}
 
-	return function.Serve(&Function{log: log, TTL: ttl},
+	if c.FeatureGates != "" {
+		if err := features.FeatureGate.Set(c.FeatureGates); err != nil {
+			return err
+		}
+	}
+
+	return function.Serve(&Function{log: log, ttl: ttl},
 		function.Listen(c.Network, c.Address),
 		function.MTLSCertificates(c.TLSCertsDir),
 		function.Insecure(c.Insecure),

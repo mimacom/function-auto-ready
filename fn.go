@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"maps"
+	"regexp"
 	"time"
 
+	"google.golang.org/protobuf/types/known/durationpb"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/crossplane/function-sdk-go/errors"
@@ -13,9 +17,12 @@ import (
 	"github.com/crossplane/function-sdk-go/resource"
 	"github.com/crossplane/function-sdk-go/response"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 
+	"github.com/crossplane/function-auto-ready/cel"
+	"github.com/crossplane/function-auto-ready/features"
 	"github.com/crossplane/function-auto-ready/healthchecks"
+	"github.com/crossplane/function-auto-ready/input/v1beta1"
 )
 
 // Function returns whatever response you ask it to.
@@ -23,14 +30,28 @@ type Function struct {
 	fnv1.UnimplementedFunctionRunnerServiceServer
 
 	log logging.Logger
-	TTL time.Duration
+	ttl time.Duration
 }
 
 // RunFunction runs the Function.
 func (f *Function) RunFunction(_ context.Context, req *fnv1.RunFunctionRequest) (*fnv1.RunFunctionResponse, error) {
 	f.log.Debug("Running Function", "tag", req.GetMeta().GetTag())
 
-	rsp := response.To(req, f.TTL)
+	rsp := response.To(req, f.ttl)
+
+	in := &v1beta1.Input{}
+	if err := request.GetInput(req, in); err != nil {
+		response.Fatal(rsp, errors.Wrapf(err, "cannot get Function input from %T", req))
+		return rsp, nil
+	}
+	if in.TTL != "" {
+		dur, err := time.ParseDuration(in.TTL)
+		if err != nil {
+			response.Fatal(rsp, errors.Wrapf(err, "cannot set ttl"))
+			return rsp, nil
+		}
+		rsp.Meta.Ttl = durationpb.New(dur)
+	}
 
 	oxr, err := request.GetObservedCompositeResource(req)
 	if err != nil {
@@ -57,7 +78,59 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1.RunFunctionRequest) 
 
 	f.log.Debug("Found desired resources", "count", len(desired))
 
-	// First, mark standard Kubernetes resources as ready using resource-specific health checks
+	// First mark resources based on CEL customizations if CELHealthcheckCustomizations alpha feature is enabled
+	if features.FeatureGate.Enabled(features.CELHealthcheckCustomizations) {
+		// Evaluate the CEL health checks customizations
+		// both CELHealthCheckCustomizationFrom and CELHealthCheckCustomization are merged into celHealthChecks
+		// with inline CELHealthCheckCustomization taking precedence over customization passed via context
+		celHealthchecks := make(map[string]string)
+
+		if in.CELHealthCheckCustomizationFrom != nil {
+			// Initialize celHealthchecks with context entries
+			celHealthchecks = GetNestedMap(req.GetContext().AsMap(), *in.CELHealthCheckCustomizationFrom)
+		}
+
+		if in.CELHealthCheckCustomization != nil {
+			// Merge inline cel health checks with existing health checks, overwrite existing entries if they exist
+			maps.Copy(celHealthchecks, *in.CELHealthCheckCustomization)
+		}
+
+		celResolver := cel.Resolver{
+			HealthCheckRegistry: celHealthchecks,
+		}
+
+		for name, dr := range desired {
+			log := log.WithValues("composed-resource-name", name)
+
+			// Skip if resource doesn't exist yet
+			or, ok := observed[name]
+			if !ok {
+				continue
+			}
+
+			// Skip if readiness already explicitly set
+			if dr.Ready != resource.ReadyUnspecified {
+				continue
+			}
+
+			// Check if this resource type has a registered health check customization
+			gvk := or.Resource.GroupVersionKind()
+
+			if celQuery, found := celResolver.GetHealthCheck(gvk); found {
+				log.Debug("Using resource-specific health check customization", "gvk", gvk.String())
+				ready, err := celResolver.HealthDeriveFromCelQuery(celQuery, or.Resource.Object)
+				if err != nil {
+					response.Warning(rsp, err)
+					log.Debug(fmt.Sprintf("Encountered error during resource-specific health check customization evaluation: %s", err.Error()), "gvk", gvk.String())
+					continue
+				}
+
+				dr.Ready = ready
+			}
+		}
+	}
+
+	// Second, mark standard Kubernetes resources as ready using resource-specific health checks
 	for name, dr := range desired {
 		log := log.WithValues("composed-resource-name", name)
 
@@ -85,7 +158,7 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1.RunFunctionRequest) 
 		}
 	}
 
-	// Second, check remaining resources using the Ready status condition
+	// Third, check remaining resources using the Ready status condition
 	for name, dr := range desired {
 		log := log.WithValues("composed-resource-name", name)
 
@@ -112,7 +185,7 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1.RunFunctionRequest) 
 		log.Debug("Found desired resource with unknown readiness")
 		// If this observed resource has a status condition with type: Ready,
 		// status: True, we set its readiness to true.
-		c := or.Resource.GetCondition(xpv1.TypeReady)
+		c := or.Resource.GetCondition(xpv2.TypeReady)
 		if c.Status == corev1.ConditionTrue {
 			log.Debug("Automatically determined that composed resource is ready")
 			dr.Ready = resource.ReadyTrue
@@ -125,4 +198,59 @@ func (f *Function) RunFunction(_ context.Context, req *fnv1.RunFunctionRequest) 
 	}
 
 	return rsp, nil
+}
+
+func GetNestedMap(context map[string]any, key string) map[string]string {
+	parts, err := ParseNestedKey(key)
+	if err != nil {
+		return nil
+	}
+
+	currentValue := any(context)
+	for _, k := range parts {
+		// Check if the current value is a map
+		if nestedMap, ok := currentValue.(map[string]any); ok {
+			// Get the next value in the nested map
+			if nextValue, exists := nestedMap[k]; exists {
+				currentValue = nextValue
+			} else {
+				return nil
+			}
+		} else {
+			return nil
+		}
+	}
+
+	// Convert the final value to a map[string]string
+	if resultAny, ok := currentValue.(map[string]any); ok {
+		result := make(map[string]string)
+		for k, vAny := range resultAny {
+			v, ok := vAny.(string)
+			if ok {
+				result[k] = v
+			}
+		}
+		return result
+	}
+	return nil
+}
+
+// ParseNestedKey enables the bracket and dot notation to key reference
+func ParseNestedKey(key string) ([]string, error) {
+	var parts []string
+	// Regular expression to extract keys, supporting both dot and bracket notation
+	regex := regexp.MustCompile(`\[([^\[\]]+)\]|([^.\[\]]+)`)
+	matches := regex.FindAllStringSubmatch(key, -1)
+	for _, match := range matches {
+		if match[1] != "" {
+			parts = append(parts, match[1]) // Bracket notation
+		} else if match[2] != "" {
+			parts = append(parts, match[2]) // Dot notation
+		}
+	}
+
+	if len(parts) == 0 {
+		return nil, errors.New("invalid key")
+	}
+	return parts, nil
 }
